@@ -1,6 +1,69 @@
-"""Presentation-only chat screen for the Music Passport journey."""
+"""Interactive chat screen for the Music Passport journey."""
+
+from html import escape
 
 import streamlit as st
+
+
+MOOD_CHOICES = ("😊 설레는", "🌿 차분한", "⚡ 신나는", "🌧️ 우울한")
+SITUATION_CHOICES = ("☕ 카페", "🚇 출퇴근", "💻 집중", "🌙 밤 산책")
+CITY_CHOICES = ("🇬🇧 런던", "🇫🇷 파리", "🇯🇵 도쿄", "🇰🇷 서울", "🇲🇦 마라케시")
+STEPS = ("mood", "situation", "city", "complete")
+
+
+def select_choice(state_key: str, value: str, next_step: str) -> None:
+    """Persist a choice and advance the conversation on the next rerun."""
+    st.session_state[state_key] = value
+    st.session_state["conversation_step"] = next_step
+
+
+def reset_conversation() -> None:
+    """Clear the journey without disturbing unrelated Streamlit state."""
+    for key in ("conversation_step", "mood", "situation", "city"):
+        st.session_state.pop(key, None)
+
+
+def render_ai_message(message: str) -> None:
+    st.markdown(
+        f"""
+        <div class="message-row chat-message">
+            <div class="avatar" role="img" aria-label="AI 컨시어지 프로필 이미지 임시 표시"></div>
+            <div>
+                <p class="speaker">AI TRAVEL CONCIERGE</p>
+                <div class="bubble">{message}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_user_message(message: str) -> None:
+    st.markdown(
+        f"""
+        <div class="user-row chat-message">
+            <div class="user-message">
+                <p class="speaker">YOU</p>
+                <div class="user-bubble">{escape(message)}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_choices(state_key: str, choices: tuple[str, ...], next_step: str) -> None:
+    st.markdown('<p class="choice-label">하나를 선택해주세요.</p>', unsafe_allow_html=True)
+    columns = st.columns(2)
+    for index, choice in enumerate(choices):
+        with columns[index % 2]:
+            st.button(
+                choice,
+                key=f"{state_key}-{index}",
+                use_container_width=True,
+                on_click=select_choice,
+                args=(state_key, choice, next_step),
+            )
 
 
 st.set_page_config(
@@ -9,6 +72,9 @@ st.set_page_config(
     layout="centered",
     initial_sidebar_state="collapsed",
 )
+
+if st.session_state.get("conversation_step") not in STEPS:
+    st.session_state["conversation_step"] = "mood"
 
 st.markdown(
     """
@@ -98,6 +164,7 @@ st.markdown(
     }
 
     .message-row { display: flex; align-items: flex-start; gap: 0.85rem; }
+    .chat-message { margin-top: 2rem; }
     .avatar {
         width: 38px;
         height: 38px;
@@ -169,7 +236,7 @@ st.markdown(
     }
     .stButton > button:active { transform: translateY(0); }
 
-    .user-row { display: flex; justify-content: flex-end; margin-top: 2rem; }
+    .user-row { display: flex; justify-content: flex-end; }
     .user-message { text-align: right; }
     .user-message .speaker { margin-right: 0.25rem; }
     .user-bubble {
@@ -217,54 +284,46 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+step_number = min(STEPS.index(st.session_state["conversation_step"]) + 1, 3)
+
 st.markdown(
-    """
+    f"""
     <header class="passport-header">
         <div class="wordmark"><span class="logo-mark">♪</span>Music Passport</div>
-        <div class="step">Step 1</div>
+        <div class="step">Step {step_number} / 3</div>
     </header>
     <section class="journey-intro" aria-labelledby="journey-title">
         <p class="eyebrow">Your music journey</p>
         <h1 id="journey-title">기분에서 시작하는 음악 여행</h1>
     </section>
-    <section aria-label="AI 여행 컨시어지와의 대화">
-        <div class="message-row">
-            <div class="avatar" role="img" aria-label="AI 컨시어지 프로필 이미지 임시 표시"></div>
-            <div>
-                <p class="speaker">AI TRAVEL CONCIERGE</p>
-                <div class="bubble">안녕하세요.<br>오늘은 어떤 음악 여행을 떠나볼까요?</div>
-            </div>
-        </div>
-        <p class="choice-label">지금의 기분과 가장 가까운 것을 골라주세요.</p>
-    </section>
+    <section aria-label="AI 여행 컨시어지와의 대화"></section>
     """,
     unsafe_allow_html=True,
 )
 
-choices = ("😊 설레는", "🌿 차분한", "⚡ 신나는", "🌧️ 우울한")
-columns = st.columns(2)
-selected = None
-for index, choice in enumerate(choices):
-    with columns[index % 2]:
-        if st.button(choice, key=f"mood-{index}", use_container_width=True):
-            selected = choice
+render_ai_message("안녕하세요.<br>오늘은 어떤 음악 여행을 떠나볼까요?<br><br>지금의 기분과 가장 가까운 것은 무엇인가요?")
 
-# This local state only demonstrates how a choice will appear in the chat UI.
-if selected:
-    st.session_state["mood_preview"] = selected
+if st.session_state.get("mood"):
+    render_user_message(st.session_state["mood"])
+    render_ai_message("이 음악을 어떤 상황에서 듣고 싶으신가요?")
 
-if st.session_state.get("mood_preview"):
-    st.markdown(
-        f"""
-        <div class="user-row" aria-live="polite">
-            <div class="user-message">
-                <p class="speaker">YOU</p>
-                <div class="user-bubble">{st.session_state['mood_preview']}</div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+if st.session_state.get("situation"):
+    render_user_message(st.session_state["situation"])
+    render_ai_message("이번 음악 여행은 어느 도시로 떠나볼까요?")
+
+if st.session_state.get("city"):
+    render_user_message(st.session_state["city"])
+    render_ai_message("좋습니다.<br>선택한 도시로 음악 여행을 준비하고 있습니다.")
+
+current_step = st.session_state["conversation_step"]
+if current_step == "mood":
+    render_choices("mood", MOOD_CHOICES, "situation")
+elif current_step == "situation":
+    render_choices("situation", SITUATION_CHOICES, "city")
+elif current_step == "city":
+    render_choices("city", CITY_CHOICES, "complete")
+
+st.button("다시 시작하기", key="restart", on_click=reset_conversation)
 
 st.markdown(
     """
