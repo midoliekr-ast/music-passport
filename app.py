@@ -505,6 +505,14 @@ SPOTIFY_TRACK_MATCH_MIN = 0.78
 SPOTIFY_ARTIST_MATCH_MIN = 0.80
 NORMAL_FALLBACK_TRACK_MATCH_MIN = 0.70
 NORMAL_FALLBACK_ARTIST_MATCH_MIN = 0.74
+SPOTIFY_TRACK_NAME_ALIASES = {
+    "안동역에서": ("At Andong Station",),
+}
+SPOTIFY_ARTIST_NAME_ALIASES = {
+    "진성": ("Jinsung", "Jin Sung"),
+}
+_SPOTIFY_REFRESHED_ACCESS_TOKEN = ""
+_SPOTIFY_ARTIST_GENRE_CACHE: dict[str, tuple[str, ...]] = {}
 logger = logging.getLogger("music_passport")
 logger.setLevel(logging.INFO)
 
@@ -1004,7 +1012,14 @@ class RecommendationCountError(JourneyBuildError):
         seen_track_ids: tuple[str, ...] = (),
         seen_track_keys: tuple[str, ...] = (),
     ) -> None:
-        super().__init__("recommendation_count_shortfall")
+        stage = (
+            "genre_validation_failed"
+            if actual == 0 and rejection_summary.get("genre_mismatch", 0) > 0
+            else "no_verified_tracks"
+            if actual == 0
+            else "recommendation_count_shortfall"
+        )
+        super().__init__(stage)
         self.requested = requested
         self.actual = actual
         self.scopes_attempted = scopes_attempted
@@ -2051,6 +2066,33 @@ def match_score(expected: str, actual: str) -> float:
     return SequenceMatcher(None, expected_name, actual_name).ratio()
 
 
+def spotify_name_match_score(
+    expected: str,
+    actual: str,
+    aliases: dict[str, tuple[str, ...]],
+) -> float:
+    """Score official localized/romanized Spotify names without weakening identity."""
+    variants = (expected, *aliases.get(expected.strip(), ()))
+    return max(match_score(variant, actual) for variant in variants)
+
+
+def refresh_spotify_access_token() -> str:
+    """Invalidate the cached credential and refresh it exactly once per 401 retry."""
+    global _SPOTIFY_REFRESHED_ACCESS_TOKEN
+    get_spotify_access_token.clear()
+    try:
+        _SPOTIFY_REFRESHED_ACCESS_TOKEN = get_spotify_access_token()
+    except JourneyBuildError as exc:
+        raise JourneyBuildError("spotify_auth_failed") from exc
+    logger.info("[SPOTIFY] access token refreshed after 401")
+    return _SPOTIFY_REFRESHED_ACCESS_TOKEN
+
+
+def effective_spotify_access_token(access_token: str) -> str:
+    """Prefer a token refreshed earlier in the current process."""
+    return _SPOTIFY_REFRESHED_ACCESS_TOKEN or access_token
+
+
 def search_spotify_track(
     track_name: str,
     artist_name: str,
@@ -2060,7 +2102,7 @@ def search_spotify_track(
     light_match: bool = False,
 ) -> dict | None:
     """Search Spotify and return only a sufficiently close track match."""
-    search_queries = (
+    search_queries = [
         (
             "strict",
             {
@@ -2079,7 +2121,24 @@ def search_spotify_track(
                 "limit": 10,
             },
         ),
-    )
+    ]
+    track_aliases = SPOTIFY_TRACK_NAME_ALIASES.get(track_name.strip(), ())
+    artist_aliases = SPOTIFY_ARTIST_NAME_ALIASES.get(artist_name.strip(), ())
+    if track_aliases or artist_aliases:
+        search_queries.append(
+            (
+                "localized_alias",
+                {
+                    "q": (
+                        f"{track_aliases[0] if track_aliases else track_name} "
+                        f"{artist_aliases[0] if artist_aliases else artist_name}"
+                    ),
+                    "type": "track",
+                    "market": "KR",
+                    "limit": 10,
+                },
+            )
+        )
     accepted_item: dict | None = None
 
     for query_mode, params in search_queries:
@@ -2091,12 +2150,20 @@ def search_spotify_track(
             query_mode,
         )
         try:
-            response = requests.get(
-                "https://api.spotify.com/v1/search",
-                headers={"Authorization": f"Bearer {access_token}"},
-                params=params,
-                timeout=recommendation_request_timeout(deadline, 10.0),
-            )
+            for auth_attempt in range(2):
+                response = requests.get(
+                    "https://api.spotify.com/v1/search",
+                    headers={
+                        "Authorization": (
+                            f"Bearer {effective_spotify_access_token(access_token)}"
+                        )
+                    },
+                    params=params,
+                    timeout=recommendation_request_timeout(deadline, 10.0),
+                )
+                if response.status_code != 401 or auth_attempt == 1:
+                    break
+                refresh_spotify_access_token()
             logger.info(
                 "[SPOTIFY] search status=%s artist=%s track=%s mode=%s",
                 response.status_code,
@@ -2128,6 +2195,14 @@ def search_spotify_track(
             )
         except JourneyBuildError:
             raise
+        except requests.Timeout as exc:
+            ensure_recommendation_deadline(deadline)
+            logger.exception(
+                "[SPOTIFY] timeout artist=%s track=%s",
+                artist_name,
+                track_name,
+            )
+            raise JourneyBuildError("spotify_timeout") from exc
         except requests.RequestException as exc:
             ensure_recommendation_deadline(deadline)
             logger.exception(
@@ -2151,10 +2226,18 @@ def search_spotify_track(
                 for artist in item.get("artists", [])
                 if artist.get("name")
             ]
-            track_score = match_score(track_name, item.get("name", ""))
+            track_score = spotify_name_match_score(
+                track_name,
+                item.get("name", ""),
+                SPOTIFY_TRACK_NAME_ALIASES,
+            )
             artist_score = max(
                 (
-                    match_score(artist_name, actual_artist)
+                    spotify_name_match_score(
+                        artist_name,
+                        actual_artist,
+                        SPOTIFY_ARTIST_NAME_ALIASES,
+                    )
                     for actual_artist in actual_artists
                 ),
                 default=0.0,
@@ -2234,6 +2317,7 @@ def search_spotify_track(
         "album_image_url": images[0].get("url", "") if images else "",
         "spotify_url": item.get("external_urls", {}).get("spotify", ""),
         "spotify_uri": item.get("uri", ""),
+        "isrc": item.get("external_ids", {}).get("isrc", ""),
         "duration_ms": item.get("duration_ms", 0),
     }
 
@@ -2243,18 +2327,39 @@ def get_spotify_artist_genres(
     access_token: str,
     deadline: float | None = None,
 ) -> list[str]:
-    """Fetch Spotify artist genres for explicit-genre verification."""
+    """Fetch uncached artist genres in one request, refreshing once after 401."""
     unique_ids = list(dict.fromkeys(artist_id for artist_id in artist_ids if artist_id))
     if not unique_ids:
         return []
+    uncached_ids = [
+        artist_id
+        for artist_id in unique_ids
+        if artist_id not in _SPOTIFY_ARTIST_GENRE_CACHE
+    ]
+    if not uncached_ids:
+        return list(
+            dict.fromkeys(
+                genre
+                for artist_id in unique_ids
+                for genre in _SPOTIFY_ARTIST_GENRE_CACHE[artist_id]
+            )
+        )
     ensure_recommendation_deadline(deadline)
     try:
-        response = requests.get(
-            "https://api.spotify.com/v1/artists",
-            headers={"Authorization": f"Bearer {access_token}"},
-            params={"ids": ",".join(unique_ids[:50])},
-            timeout=recommendation_request_timeout(deadline, 10.0),
-        )
+        for auth_attempt in range(2):
+            response = requests.get(
+                "https://api.spotify.com/v1/artists",
+                headers={
+                    "Authorization": (
+                        f"Bearer {effective_spotify_access_token(access_token)}"
+                    )
+                },
+                params={"ids": ",".join(uncached_ids[:50])},
+                timeout=recommendation_request_timeout(deadline, 10.0),
+            )
+            if response.status_code != 401 or auth_attempt == 1:
+                break
+            refresh_spotify_access_token()
         if not response.ok:
             if response.status_code in (401, 403):
                 raise JourneyBuildError("spotify_auth_failed")
@@ -2263,17 +2368,32 @@ def get_spotify_artist_genres(
             if response.status_code >= 500:
                 raise JourneyBuildError("spotify_service_unavailable")
             raise JourneyBuildError("spotify_search_failed")
+        artists = response.json().get("artists", [])
+        for requested_id, artist in zip(uncached_ids, artists):
+            genres = (
+                tuple(
+                    genre
+                    for genre in artist.get("genres", [])
+                    if isinstance(genre, str) and genre
+                )
+                if isinstance(artist, dict)
+                else ()
+            )
+            _SPOTIFY_ARTIST_GENRE_CACHE[requested_id] = genres
+        for missing_id in uncached_ids[len(artists):]:
+            _SPOTIFY_ARTIST_GENRE_CACHE[missing_id] = ()
         return list(
             dict.fromkeys(
                 genre
-                for artist in response.json().get("artists", [])
-                if isinstance(artist, dict)
-                for genre in artist.get("genres", [])
-                if isinstance(genre, str) and genre
+                for artist_id in unique_ids
+                for genre in _SPOTIFY_ARTIST_GENRE_CACHE.get(artist_id, ())
             )
         )
     except JourneyBuildError:
         raise
+    except requests.Timeout as exc:
+        ensure_recommendation_deadline(deadline)
+        raise JourneyBuildError("spotify_timeout") from exc
     except requests.RequestException as exc:
         ensure_recommendation_deadline(deadline)
         raise JourneyBuildError("spotify_network_failed") from exc
@@ -2922,11 +3042,22 @@ def generate_and_verify_scope_tracks(
                 continue
 
             if selected_genres:
-                spotify_artist_genres = get_spotify_artist_genres(
-                    list(spotify_track.get("artist_ids") or []),
-                    access_token,
-                    deadline=deadline,
-                )
+                try:
+                    spotify_artist_genres = get_spotify_artist_genres(
+                        list(spotify_track.get("artist_ids") or []),
+                        access_token,
+                        deadline=deadline,
+                    )
+                except JourneyBuildError as exc:
+                    if exc.stage == "spotify_auth_failed":
+                        raise
+                    logger.warning(
+                        "[SPOTIFY] artist genres unavailable stage=%s "
+                        "artist_ids=%s; using structured genre evidence",
+                        exc.stage,
+                        spotify_track.get("artist_ids") or [],
+                    )
+                    spotify_artist_genres = []
                 spotify_track["artist_genres"] = spotify_artist_genres
                 structured_genre_match = genre_evidence_matches(
                     selected_genres,
