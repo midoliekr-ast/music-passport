@@ -564,6 +564,73 @@ PREFERENCE_SECTION_LABELS = {
     "favorite_artists": "좋아하는 아티스트",
     "favorite_reasons": "좋아하는 이유",
 }
+EXPLICIT_GENRE_ALIASES = {
+    "Jazz Hip Hop": (
+        "jazz hip hop", "jazz rap", "jazzy hip hop", "jazzy beats",
+    ),
+    "Lo-fi Hip Hop": ("lo-fi hip hop", "lofi hip hop", "lo-fi beats"),
+    "Jazz": (
+        "jazz", "contemporary jazz", "modern jazz", "jazz fusion", "nu jazz",
+    ),
+    "R&B / Soul": ("r&b", "rhythm and blues", "soul", "neo soul"),
+    "Electronic": ("electronic", "electronica", "electro", "ambient electronic"),
+    "Afrobeat": ("afrobeat", "afrobeats", "afro jazz", "highlife"),
+    "African Jazz / Afro Jazz": (
+        "african jazz", "afro jazz", "ethio jazz", "cape jazz",
+    ),
+    "Latin": (
+        "latin", "latin jazz", "salsa", "son cubano", "bolero", "bossa nova",
+    ),
+    "Reggae": ("reggae", "roots reggae", "dub", "rocksteady"),
+    "Indie": ("indie", "indie rock", "indie pop", "alternative"),
+    "트로트": (
+        "트로트", "한국 트로트", "성인가요", "트로트 발라드",
+        "국악 트로트", "korean trot", "trot",
+    ),
+    "민속음악 / 전통음악": (
+        "민속음악", "전통음악", "folk", "traditional", "indigenous music",
+        "traditional instruments", "world folk", "folk fusion",
+    ),
+}
+
+
+def preference_values(preferences: str, label: str) -> tuple[str, ...]:
+    """Read a comma-separated preference line from the persisted answer text."""
+    prefix = f"{label}: "
+    for line in preferences.splitlines():
+        if line.startswith(prefix):
+            return tuple(
+                value.strip()
+                for value in line[len(prefix):].split(",")
+                if value.strip() and value.strip() not in {"상관없어요", "상관없음"}
+            )
+    return ()
+
+
+def selected_genres_from_preferences(preferences: str) -> tuple[str, ...]:
+    """Return only genres the user explicitly selected."""
+    return preference_values(preferences, PREFERENCE_SECTION_LABELS["favorite_genres"])
+
+
+def genre_evidence_matches(
+    selected_genres: tuple[str, ...],
+    *evidence_values: str,
+) -> bool:
+    """Match structured/Spotify genre evidence to any explicitly selected genre."""
+    if not selected_genres:
+        return True
+    evidence = " ".join(
+        unicodedata.normalize("NFKC", value).casefold()
+        for value in evidence_values
+        if value
+    )
+    return any(
+        any(
+            unicodedata.normalize("NFKC", alias).casefold() in evidence
+            for alias in EXPLICIT_GENRE_ALIASES.get(genre, (genre,))
+        )
+        for genre in selected_genres
+    )
 CUSTOM_COUNTRY_DESTINATIONS = {
     "일본": ("Japan", "日本"),
     "영국": ("United Kingdom", "영국"),
@@ -885,6 +952,8 @@ class TrackCandidate(BaseModel):
     country: str
     connection_level: Literal["city", "region", "country"]
     city_connection: str
+    genre: str
+    genre_connection: str
     recommendation_reason: str
 
 
@@ -2155,6 +2224,11 @@ def search_spotify_track(
             for artist in item.get("artists", [])
             if artist.get("name")
         ],
+        "artist_ids": [
+            artist.get("id", "")
+            for artist in item.get("artists", [])
+            if artist.get("id")
+        ],
         "album_id": item.get("album", {}).get("id", ""),
         "album_name": item.get("album", {}).get("name", ""),
         "album_image_url": images[0].get("url", "") if images else "",
@@ -2162,6 +2236,49 @@ def search_spotify_track(
         "spotify_uri": item.get("uri", ""),
         "duration_ms": item.get("duration_ms", 0),
     }
+
+
+def get_spotify_artist_genres(
+    artist_ids: list[str],
+    access_token: str,
+    deadline: float | None = None,
+) -> list[str]:
+    """Fetch Spotify artist genres for explicit-genre verification."""
+    unique_ids = list(dict.fromkeys(artist_id for artist_id in artist_ids if artist_id))
+    if not unique_ids:
+        return []
+    ensure_recommendation_deadline(deadline)
+    try:
+        response = requests.get(
+            "https://api.spotify.com/v1/artists",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"ids": ",".join(unique_ids[:50])},
+            timeout=recommendation_request_timeout(deadline, 10.0),
+        )
+        if not response.ok:
+            if response.status_code in (401, 403):
+                raise JourneyBuildError("spotify_auth_failed")
+            if response.status_code == 429:
+                raise JourneyBuildError("spotify_rate_limited")
+            if response.status_code >= 500:
+                raise JourneyBuildError("spotify_service_unavailable")
+            raise JourneyBuildError("spotify_search_failed")
+        return list(
+            dict.fromkeys(
+                genre
+                for artist in response.json().get("artists", [])
+                if isinstance(artist, dict)
+                for genre in artist.get("genres", [])
+                if isinstance(genre, str) and genre
+            )
+        )
+    except JourneyBuildError:
+        raise
+    except requests.RequestException as exc:
+        ensure_recommendation_deadline(deadline)
+        raise JourneyBuildError("spotify_network_failed") from exc
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise JourneyBuildError("spotify_response_invalid") from exc
 
 
 def find_lisbon_single_track_fallback(
@@ -2255,6 +2372,28 @@ def generate_track_candidates(
 ) -> JourneyCandidates:
     """Generate candidates for exactly one geographic connection level."""
     api_key = get_required_secret("OPENAI_API_KEY", "openai_api_key")
+    selected_genres = selected_genres_from_preferences(free_text_preferences)
+    selected_genre_aliases = {
+        genre: EXPLICIT_GENRE_ALIASES.get(genre, (genre,))
+        for genre in selected_genres
+    }
+    explicit_genre_guard = (
+        "\n사용자가 명시적으로 선택한 장르는 추천의 최우선 필수 조건입니다. "
+        f"선택 장르: {', '.join(selected_genres)}. "
+        f"허용되는 직접 관련 장르 표현: {selected_genre_aliases}. "
+        "모든 후보는 선택 장르 자체, 그 하위 장르, 또는 직접 연결된 "
+        "크로스오버에 속해야 합니다. 도시와 국가는 그 다음 우선순위이며, "
+        "탐색 수준, 기분과 상황, 선호 아티스트, BPM과 보컬은 선택 장르 "
+        "안에서 곡을 고르는 보조 기준일 뿐입니다. 선호 아티스트의 실제 "
+        "장르가 선택 장르와 다르면 그 아티스트나 그 장르의 곡을 추천하지 "
+        "마세요. 예: 장르=트로트, 선호 아티스트=Nujabes이면 Nujabes와 "
+        "재즈 힙합을 제외하고 트로트 안에서 정서와 리듬만 참고하세요. "
+        "재시도, 보완, 내부 보장 검색에서도 이 장르 조건을 완화하거나 "
+        "삭제하지 마세요. genre에는 실제 장르명을, genre_connection에는 "
+        "선택 장르와의 구체적인 연결을 한국어로 작성하세요.\n"
+        if selected_genres
+        else ""
+    )
     candidate_limit = (
         max(track_count * 6, 12)
         if retry_strategy
@@ -2358,6 +2497,7 @@ def generate_track_candidates(
                         "작성하세요. 허용되는 관계는 "
                         f"{scope_instructions[connection_level]}입니다. "
                         f"{geographic_guard}"
+                        f"{explicit_genre_guard}"
                         "분위기 유사성, 장르 인기, 세계적 히트, 단순 공연 "
                         "이력만으로는 어떤 단계에서도 관련성을 인정하지 마세요. "
                         "city_connection에는 출생지, 결성지, 활동 거점, 공식 "
@@ -2380,11 +2520,13 @@ def generate_track_candidates(
                         f"생성 시도: {attempt}/{retry_max_attempts}\n"
                         f"이번 재검색 단계: {retry_strategy or '기본 검색'}\n"
                         + retry_guidance
+                        + explicit_genre_guard
                         + f"기분: {mood}\n상황: {situation}\n템포: {tempo}\n"
                         f"보컬: {vocal}\n탐색 수준: {discovery_level}\n"
                         f"현재 범위에서 필요한 곡 수: {track_count}\n"
                         f"이번 범위의 후보 생성 상한: {candidate_limit}\n"
                         f"추가 취향: {free_text_preferences or '없음'}\n"
+                        f"명시 선택 장르: {', '.join(selected_genres) or '없음'}\n"
                         f"{exclusions}\n"
                         "Spotify에서 실재 여부를 확인할 수 있도록 공식 곡명과 "
                         "아티스트명으로, 제외 목록과 겹치지 않는 다양한 후보를 "
@@ -2441,6 +2583,25 @@ def generate_track_candidates(
         raise JourneyBuildError("openai_output_parsed")
     filtered_candidates = []
     for candidate in parsed.candidates:
+        if selected_genres and not genre_evidence_matches(
+            selected_genres,
+            candidate.genre,
+            candidate.genre_connection,
+            candidate.recommendation_reason,
+        ):
+            if rejection_summary is not None:
+                rejection_summary["genre_mismatch"] = (
+                    rejection_summary.get("genre_mismatch", 0) + 1
+                )
+            logger.info(
+                "[RECOMMENDATION] candidate=%s — %s reason=genre "
+                "selected=%s candidate_genre=%s",
+                candidate.track_name,
+                candidate.artist_name,
+                selected_genres,
+                candidate.genre,
+            )
+            continue
         if (
             candidate.connection_level != connection_level
             and city_is_required
@@ -2562,6 +2723,11 @@ def generate_and_verify_scope_tracks(
     """Generate and Spotify-verify one scope, retrying only for shortfalls."""
     verified_tracks: list[dict] = []
     generated_candidate_count = 0
+    selected_genres = selected_genres_from_preferences(free_text_preferences)
+    preferred_artists = preference_values(
+        free_text_preferences,
+        PREFERENCE_SECTION_LABELS["favorite_artists"],
+    )
     connection_labels = {
         "city": "도시 연결",
         "region": "지역 연결",
@@ -2755,6 +2921,53 @@ def generate_and_verify_scope_tracks(
                 dedupe_state["rejected_candidate_labels"].add(candidate_label)
                 continue
 
+            if selected_genres:
+                spotify_artist_genres = get_spotify_artist_genres(
+                    list(spotify_track.get("artist_ids") or []),
+                    access_token,
+                    deadline=deadline,
+                )
+                spotify_track["artist_genres"] = spotify_artist_genres
+                structured_genre_match = genre_evidence_matches(
+                    selected_genres,
+                    candidate.genre,
+                    candidate.genre_connection,
+                    candidate.recommendation_reason,
+                )
+                spotify_genre_match = genre_evidence_matches(
+                    selected_genres,
+                    *spotify_artist_genres,
+                    str(spotify_track.get("album_name") or ""),
+                )
+                actual_artist_keys_for_genre = {
+                    normalize_spotify_name(artist)
+                    for artist in spotify_track.get("artists", [])
+                    if artist
+                }
+                preferred_artist_is_candidate = any(
+                    normalize_spotify_name(preferred_artist)
+                    in actual_artist_keys_for_genre
+                    for preferred_artist in preferred_artists
+                )
+                if (
+                    not structured_genre_match
+                    or (bool(spotify_artist_genres) and not spotify_genre_match)
+                    or (preferred_artist_is_candidate and not spotify_genre_match)
+                ):
+                    rejection_summary["genre_mismatch"] += 1
+                    logger.info(
+                        "[RECOMMENDATION] candidate=%s reason=genre "
+                        "selected=%s candidate_genre=%s spotify_genres=%s "
+                        "preferred_artist_candidate=%s",
+                        candidate_label,
+                        selected_genres,
+                        candidate.genre,
+                        spotify_artist_genres,
+                        preferred_artist_is_candidate,
+                    )
+                    dedupe_state["rejected_candidate_labels"].add(candidate_label)
+                    continue
+
             track_id = spotify_track["spotify_id"]
             actual_artists = spotify_track.get("artists", [])
             actual_artist_keys = {
@@ -2809,7 +3022,14 @@ def generate_and_verify_scope_tracks(
                 {
                     "connection_level": connection_level,
                     "city_connection": connection_reason,
-                    "recommendation_reason": candidate.recommendation_reason,
+                    "recommendation_reason": (
+                        f"장르 연결: {candidate.genre_connection.strip()} "
+                        f"{candidate.recommendation_reason.strip()}"
+                        if selected_genres
+                        else candidate.recommendation_reason
+                    ),
+                    "genre": candidate.genre,
+                    "genre_connection": candidate.genre_connection,
                     "is_placeholder": False,
                 }
             )
@@ -3357,6 +3577,7 @@ def build_music_journey(
         "spotify_no_match": 0,
         "geographic_mismatch": 0,
         "connection_level": 0,
+        "genre_mismatch": 0,
     }
 
     scope_levels: tuple[Literal["city", "region", "country"], ...] = (
