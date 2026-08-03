@@ -600,6 +600,13 @@ EXPLICIT_GENRE_ALIASES = {
         "traditional instruments", "world folk", "folk fusion",
     ),
 }
+EXPLICIT_GENRE_EXCLUSION_TERMS = {
+    "트로트": (
+        "민요", "농요", "아리랑", "탈놀이", "별신굿", "놋다리밟기",
+        "칡부리기", "메나리", "소주타령", "국립국악원", "전통 공연",
+        "무형문화재",
+    ),
+}
 
 
 def preference_values(preferences: str, label: str) -> tuple[str, ...]:
@@ -639,6 +646,85 @@ def genre_evidence_matches(
         )
         for genre in selected_genres
     )
+
+
+def explicit_genre_prompt_rule(selected_genres: tuple[str, ...]) -> str:
+    """Build one shared hard-genre rule for every recommendation mode."""
+    if not selected_genres:
+        return ""
+    aliases = {
+        genre: EXPLICIT_GENRE_ALIASES.get(genre, (genre,))
+        for genre in selected_genres
+    }
+    exclusions = {
+        genre: EXPLICIT_GENRE_EXCLUSION_TERMS.get(genre, ())
+        for genre in selected_genres
+        if genre in EXPLICIT_GENRE_EXCLUSION_TERMS
+    }
+    return (
+        "\n사용자가 명시적으로 선택한 장르는 추천의 최우선 필수 조건입니다. "
+        f"선택 장르: {', '.join(selected_genres)}. "
+        f"허용되는 직접 관련 장르 표현: {aliases}. "
+        "모든 후보는 선택 장르 자체, 그 하위 장르, 또는 직접 연결된 "
+        "크로스오버에 속해야 합니다. 지역은 도시 → 광역 지역 → 같은 국가 "
+        "순서로 확장하되 장르는 바꾸지 마세요. 탐색 수준, 기분과 상황, "
+        "선호 아티스트, BPM과 보컬은 선택 장르 안에서 곡을 고르는 보조 "
+        "기준일 뿐입니다. 선호 아티스트의 실제 장르가 다르면 그 아티스트나 "
+        "그 장르의 곡을 추천하지 마세요. 재시도, 부족 회복, relaxed scope, "
+        "내부 보장 검색, 국가 확장, LYRA 자동 재검색과 최종 보완에서도 "
+        "이 장르 조건을 완화하거나 삭제하지 마세요. "
+        + (
+            f"선택 장르별 금지 중심 표현: {exclusions}. "
+            if exclusions
+            else ""
+        )
+        + (
+            "선택 장르가 트로트이면 지역 전통음악, 민요, 농요, 아리랑, "
+            "탈놀이, 별신굿, 국악 공연 음원을 추천하지 마세요. 도시 안에서 "
+            "충분한 트로트를 찾지 못하면 장르를 바꾸지 말고 지역만 도시 → "
+            "광역 지역 → 대한민국 순으로 확장하세요. 안동 + 트로트라면 "
+            "안동역에서 / 진성을 우선 검토하고, 이어 경상북도 또는 대한민국의 "
+            "실제 트로트를 찾으세요. "
+            if "트로트" in selected_genres
+            else ""
+        )
+        + "genre에는 실제 장르명을, genre_connection에는 선택 장르와의 "
+        "구체적인 연결을 한국어로 작성하세요.\n"
+    )
+
+
+def candidate_matches_explicit_genres(
+    candidate: "TrackCandidate",
+    selected_genres: tuple[str, ...],
+) -> bool:
+    """Apply the same hard genre gate before every Spotify lookup."""
+    if not selected_genres:
+        return True
+    if not genre_evidence_matches(
+        selected_genres,
+        candidate.genre,
+        candidate.genre_connection,
+        candidate.recommendation_reason,
+    ):
+        return False
+    combined = " ".join(
+        (
+            candidate.track_name,
+            candidate.genre,
+            candidate.genre_connection,
+            candidate.city_connection,
+            candidate.recommendation_reason,
+        )
+    ).casefold()
+    for genre in selected_genres:
+        blocked_terms = EXPLICIT_GENRE_EXCLUSION_TERMS.get(genre, ())
+        if any(term.casefold() in combined for term in blocked_terms):
+            if genre == "트로트" and "국악 트로트" in (
+                f"{candidate.genre} {candidate.genre_connection}".casefold()
+            ):
+                continue
+            return False
+    return True
 CUSTOM_COUNTRY_DESTINATIONS = {
     "일본": ("Japan", "日本"),
     "영국": ("United Kingdom", "영국"),
@@ -2493,27 +2579,7 @@ def generate_track_candidates(
     """Generate candidates for exactly one geographic connection level."""
     api_key = get_required_secret("OPENAI_API_KEY", "openai_api_key")
     selected_genres = selected_genres_from_preferences(free_text_preferences)
-    selected_genre_aliases = {
-        genre: EXPLICIT_GENRE_ALIASES.get(genre, (genre,))
-        for genre in selected_genres
-    }
-    explicit_genre_guard = (
-        "\n사용자가 명시적으로 선택한 장르는 추천의 최우선 필수 조건입니다. "
-        f"선택 장르: {', '.join(selected_genres)}. "
-        f"허용되는 직접 관련 장르 표현: {selected_genre_aliases}. "
-        "모든 후보는 선택 장르 자체, 그 하위 장르, 또는 직접 연결된 "
-        "크로스오버에 속해야 합니다. 도시와 국가는 그 다음 우선순위이며, "
-        "탐색 수준, 기분과 상황, 선호 아티스트, BPM과 보컬은 선택 장르 "
-        "안에서 곡을 고르는 보조 기준일 뿐입니다. 선호 아티스트의 실제 "
-        "장르가 선택 장르와 다르면 그 아티스트나 그 장르의 곡을 추천하지 "
-        "마세요. 예: 장르=트로트, 선호 아티스트=Nujabes이면 Nujabes와 "
-        "재즈 힙합을 제외하고 트로트 안에서 정서와 리듬만 참고하세요. "
-        "재시도, 보완, 내부 보장 검색에서도 이 장르 조건을 완화하거나 "
-        "삭제하지 마세요. genre에는 실제 장르명을, genre_connection에는 "
-        "선택 장르와의 구체적인 연결을 한국어로 작성하세요.\n"
-        if selected_genres
-        else ""
-    )
+    explicit_genre_guard = explicit_genre_prompt_rule(selected_genres)
     candidate_limit = (
         max(track_count * 6, 12)
         if retry_strategy
@@ -2703,25 +2769,6 @@ def generate_track_candidates(
         raise JourneyBuildError("openai_output_parsed")
     filtered_candidates = []
     for candidate in parsed.candidates:
-        if selected_genres and not genre_evidence_matches(
-            selected_genres,
-            candidate.genre,
-            candidate.genre_connection,
-            candidate.recommendation_reason,
-        ):
-            if rejection_summary is not None:
-                rejection_summary["genre_mismatch"] = (
-                    rejection_summary.get("genre_mismatch", 0) + 1
-                )
-            logger.info(
-                "[RECOMMENDATION] candidate=%s — %s reason=genre "
-                "selected=%s candidate_genre=%s",
-                candidate.track_name,
-                candidate.artist_name,
-                selected_genres,
-                candidate.genre,
-            )
-            continue
         if (
             candidate.connection_level != connection_level
             and city_is_required
@@ -2875,6 +2922,12 @@ def generate_and_verify_scope_tracks(
         if lisbon_single_retry
         else MAX_SCOPE_ATTEMPTS
     )
+    if (
+        lyra_auto_retry
+        and selected_genres
+        and connection_level in {"city", "region"}
+    ):
+        max_attempts = min(max_attempts, 2)
     attempted_candidate_sets: set[tuple[str, ...]] = set()
     evaluated_candidate_keys: set[str] = set()
 
@@ -2977,6 +3030,20 @@ def generate_and_verify_scope_tracks(
             )
             if lyra_auto_retry:
                 dedupe_state["candidate_labels"].add(candidate_label)
+            if not candidate_matches_explicit_genres(
+                candidate,
+                selected_genres,
+            ):
+                rejection_summary["genre_mismatch"] += 1
+                logger.info(
+                    "[RECOMMENDATION] candidate=%s reason=genre "
+                    "selected=%s candidate_genre=%s pre_spotify=true",
+                    candidate_label,
+                    selected_genres,
+                    candidate.genre,
+                )
+                dedupe_state["rejected_candidate_labels"].add(candidate_label)
+                continue
             if not candidate_matches_requested_geography(
                 candidate,
                 geography,
@@ -3059,11 +3126,9 @@ def generate_and_verify_scope_tracks(
                     )
                     spotify_artist_genres = []
                 spotify_track["artist_genres"] = spotify_artist_genres
-                structured_genre_match = genre_evidence_matches(
+                structured_genre_match = candidate_matches_explicit_genres(
+                    candidate,
                     selected_genres,
-                    candidate.genre,
-                    candidate.genre_connection,
-                    candidate.recommendation_reason,
                 )
                 spotify_genre_match = genre_evidence_matches(
                     selected_genres,
